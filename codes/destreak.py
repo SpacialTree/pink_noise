@@ -1,8 +1,12 @@
+
 import os
 from astropy.io import fits
 from scipy.ndimage import median_filter, map_coordinates
 import numpy as np
 from astropy.wcs import WCS
+from astropy.convolution import interpolate_replace_nans, Gaussian2DKernel
+import scipy
+import scipy.ndimage
 
 basepath = '/orange/adamginsburg/jwst/brick/'
 
@@ -17,17 +21,30 @@ background_mapping = { '2221':
                         'f405n': 'jw02221-o001_t001_nircam_f405n-f444w_i2d_medfilt128.fits',
                         'f182m': 'jw02221-o001_t001_nircam_clear-f182m_i2d_medfilt256.fits',
                         'f466n': 'jw02221-o001_t001_nircam_f444w-f466n_i2d_medfilt128.fits',
+                        'f444w': 'jw01182-o004_t001_nircam_clear-f444w-merged_nodestreak_realigned-to-refcat_background.fits',
+                        'f356w': 'jw01182-o004_t001_nircam_clear-f356w-merged_nodestreak_realigned-to-refcat_background.fits',
+                        'f200w': 'jw01182-o004_t001_nircam_clear-f200w-merged_nodestreak_realigned-to-refcat_background.fits',
+                        #'f115w': 'jw01182-o004_t001_nircam_clear-f115w-merged_nodestreak_realigned-to-refcat_background.fits',
                        },
                         '002':
                        {
                         'regionname': 'cloudc',
-                        'f405n': 'jw02221-o002_t001_nircam_clear-f405n-merged_realigned-to-vvv_i2d_medfilt128.fits',
+                        'f405n': 'jw02221-o002_t001_nircam_clear-f405n-merged-nodestreak_i2d-perfilt64.fits',
+                           #'jw02221-o002_t001_nircam_clear-f405n-merged-nodestreak_i2d_chunk-medfilt128.fits',
+                           #'jw02221-o002_t001_nircam_clear-f405n-merged-nodestreak_i2d_medfilt128.fits',
+                           #
+                        'f410m': 'jw02221-o002_t001_nircam_clear-f410m-merged-nodestreak_i2d-perfilt64.fits',
+                        'f466n': 'jw02221-o002_t001_nircam_clear-f466n-merged-nodestreak_i2d-perfilt64.fits',
+                        'f212n': 'jw02221-o002_t001_nircam_clear-f212n-merged-reproject-nodestreak_i2d-perfilt128.fits',
+                        'f187n': 'jw02221-o002_t001_nircam_clear-f187n-merged-reproject-nodestreak_i2d-perfilt128.fits',
+                        'f182m': 'jw02221-o002_t001_nircam_clear-f182m-merged-reproject-nodestreak_i2d-perfilt128.fits',
                        }
                       }
                      }
 
 
 def compute_zero_spacing_approximation(filename, ext=('SCI', 1), dx=128,
+                                       smooth=True,
                                        percentile=10, regs=None, progressbar=lambda x: x):
     """
     Use a local, large-scale percentile to estimate the "zero spacing"
@@ -35,6 +52,9 @@ def compute_zero_spacing_approximation(filename, ext=('SCI', 1), dx=128,
 
     We'll then use this to replace the missing zero-spacing lost from
     the destreaking process.
+
+
+    smooth: use percentile_Filter
     """
     img = fits.getdata(filename, ext=ext)
     header = fits.getheader(filename, ext=ext)
@@ -49,29 +69,42 @@ def compute_zero_spacing_approximation(filename, ext=('SCI', 1), dx=128,
             slcs,smslcs = mask.get_overlap_slices(img.shape)
             img[slcs][mask.data.astype('bool')[smslcs]] = np.nan
 
-    # the bottom-left pixel will be centered at (dx/2 + 1) in FITS coordinates if we start at 0
-    # so we start at -dx/4 so that the bottom-left pixel is centered at 1,1
-    # (BLC of image is at -0.5, -0.5 in FITS, pixel size is dx/2, so offset is dx/4)
-    # we don't want to wrap, so we use max(pixel, 0)
-    # the percentile will be over a smaller region, but that should be OK
-    chunks = [[img[(slice(max(sty, 0), sty+dx), slice(max(stx, 0), stx+dx))]
-            for stx in range(-dx//4, img.shape[1]+dx//2, dx//2)]
-            for sty in range(-dx//4, img.shape[0]+dx//2, dx//2)
-            ]
 
-    # only include positive values (actually no that didn't work)
-    arr = np.array(
-        [[np.nanpercentile(ch, percentile)  # if np.any(ch > 0) else 0
-          for ch in row]
-         for row in progressbar(chunks)]
-    )
+    if smooth:
+        kernel16 = Gaussian2DKernel(16)
+        inter16 = interpolate_replace_nans(array=img, kernel=kernel16)
+        y, x = np.mgrid[:dx, :dx]
+        circle = ((x-dx/2)**2 + (y-dx/2)**2) < (dx/2)**2
+        arr = scipy.ndimage.percentile_filter(inter16, percentile,
+                                              #size=(dx, dx),
+                                              footprint=circle,
+                                              mode='reflect',
+                                             )
+        return fits.PrimaryHDU(data=arr, header=header)
+    else:
+        # the bottom-left pixel will be centered at (dx/2 + 1) in FITS coordinates if we start at 0
+        # so we start at -dx/4 so that the bottom-left pixel is centered at 1,1
+        # (BLC of image is at -0.5, -0.5 in FITS, pixel size is dx/2, so offset is dx/4)
+        # we don't want to wrap, so we use max(pixel, 0)
+        # the percentile will be over a smaller region, but that should be OK
+        chunks = [[img[(slice(max(sty, 0), sty+dx), slice(max(stx, 0), stx+dx))]
+                for stx in range(-dx//4, img.shape[1]+dx//2, dx//2)]
+                for sty in range(-dx//4, img.shape[0]+dx//2, dx//2)
+                ]
 
-    # I can never remember how to do this, but I'm *certain* this is wrong (independent of what this next line says:)
-    # but empirically I'm _pretty_ sure dx/4 + 0.5 looks like it matches maybe
-    # with revised version, we drop the shift
-    wwsl = ww[::dx//2, ::dx//2]
+        # only include positive values (actually no that didn't work)
+        arr = np.array(
+            [[np.nanpercentile(ch, percentile)  # if np.any(ch > 0) else 0
+            for ch in row]
+            for row in progressbar(chunks)]
+        )
 
-    return fits.PrimaryHDU(data=arr, header=wwsl.to_header())
+        # I can never remember how to do this, but I'm *certain* this is wrong (independent of what this next line says:)
+        # but empirically I'm _pretty_ sure dx/4 + 0.5 looks like it matches maybe
+        # with revised version, we drop the shift
+        wwsl = ww[::dx//2, ::dx//2]
+
+        return fits.PrimaryHDU(data=arr, header=wwsl.to_header())
 
 
 def nozero_percentile(arr, pct, **kwargs):
@@ -110,7 +143,7 @@ def add_background_map(data, hdu, background_mapping=background_mapping,
                        ext=('SCI', 1),
                        return_background=False):
     filtername = hdu[0].header['PUPIL']
-    if filtername in ('CLEAR', 'F444W') and hdu[0].header['FILTER'] in ('F405N', 'F466N', 'F410M'):
+    if filtername in ('CLEAR', 'F444W') and hdu[0].header['FILTER'] in ('F405N', 'F466N', 'F410M', 'F212N', 'F187N', 'F182M'):
         filtername = hdu[0].header['FILTER']
 
     proposal_id = hdu[0].header['PROGRAM'][1:5]
@@ -180,9 +213,9 @@ def destreak(frame, percentile=10, median_filter_size=256, overwrite=True, write
                          add_smoothed=not use_background_map
                                          )
 
+    proposal_id = hdu[0].header['PROGRAM'][1:5]
+    obsid = hdu[0].header['OBSERVTN'].strip()
     if use_background_map and not (proposal_id not in background_mapping or obsid not in background_mapping[proposal_id]):
-        proposal_id = hdu[0].header['PROGRAM'][1:5]
-        obsid = hdu[0].header['OBSERVTN'].strip()
         regionname = background_mapping[proposal_id][obsid]['regionname']
         basepath = f'/orange/adamginsburg/jwst/{regionname}/'
         bgmap_path=f'{basepath}/images/'
